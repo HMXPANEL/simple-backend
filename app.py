@@ -10,14 +10,11 @@ import requests
 import uvicorn
 
 # ── Logging ───────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
+logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
 # ── App ───────────────────────────────────────────────────────────────────────
-app = FastAPI(title="Android AI Agent Backend", version="3.0.0")
+app = FastAPI(title="Jarvis Android AI Backend", version="5.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -28,14 +25,14 @@ app.add_middleware(
 )
 
 # ── Config ────────────────────────────────────────────────────────────────────
-NVIDIA_API_KEY  = os.environ.get("NVIDIA_API_KEY", "")
-NVIDIA_MODEL    = os.environ.get("NVIDIA_MODEL", "meta/llama-3.1-70b-instruct")
+NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY", "")
+NVIDIA_MODEL = os.environ.get("NVIDIA_MODEL", "meta/llama-3.1-70b-instruct")
 NVIDIA_BASE_URL = os.environ.get(
     "NVIDIA_BASE_URL",
     "https://integrate.api.nvidia.com/v1/chat/completions",
 )
 
-MAX_RETRIES     = int(os.environ.get("MAX_RETRIES", 2))
+MAX_RETRIES = int(os.environ.get("MAX_RETRIES", 2))
 REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", 30))
 MAX_HISTORY_TURNS = int(os.environ.get("MAX_HISTORY_TURNS", 6))
 
@@ -46,8 +43,7 @@ ALLOWED_ACTIONS = {
     "click",
     "type",
     "wait",
-    "scroll",
-    "search"
+    "scroll"
 }
 
 ACTION_REQUIRED_FIELDS = {
@@ -56,30 +52,54 @@ ACTION_REQUIRED_FIELDS = {
     "click": [],
     "type": ["text"],
     "wait": ["duration"],
-    "scroll": ["direction"],
-    "search": ["query"]
+    "scroll": ["direction"]
 }
 
-# ── System Prompt ─────────────────────────────────────────────────────────────
+# Optional smart fields
+OPTIONAL_FIELDS = ["wait_for", "retry", "timeout"]
+
+# ── SYSTEM PROMPTS ────────────────────────────────────────────────────────────
+
+# MULTI-TASK (one shot plan)
 SYSTEM_PROMPT = """You are an Android AI agent.
 
-Convert user input into structured JSON tasks.
+Convert user input into LOW-LEVEL executable tasks.
 
-STRICT RULES:
-- ONLY return JSON
-- NO text, NO explanation
-- ALWAYS return: {"tasks": [...]}
+Rules:
+- ONLY JSON
+- No explanation
+- Always return {"tasks":[...]}
 
-ACTIONS:
-- open_app → app
-- send_message → app, contact, message
-- click → text OR coordinates [x,y]
-- type → text
-- wait → duration (ms)
-- scroll → direction (up/down/left/right)
-- search → query
+Do NOT use abstract actions like search.
+Break into real UI steps.
 
-Return multiple tasks if needed.
+Each task can include:
+- action
+- parameters
+- wait_for
+- retry
+- timeout
+
+Return multiple steps.
+"""
+
+# AUTONOMOUS STEP (loop)
+STEP_PROMPT = """You are an autonomous Android agent.
+
+Input:
+- GOAL
+- Current UI
+- Last result
+
+Output:
+- ONE next action only
+
+Rules:
+- JSON only
+- {"tasks":[{...}]}
+
+If goal complete:
+return {"tasks":[]}
 """
 
 # ── Memory ────────────────────────────────────────────────────────────────────
@@ -114,19 +134,14 @@ def check_rate_limit(session_id):
     LAST_REQUEST[session_id] = now
     return True
 
-# ── AI Call ───────────────────────────────────────────────────────────────────
-def build_messages(session_id, user_message):
-    return [{"role": "system", "content": SYSTEM_PROMPT}] + \
-           get_history(session_id) + \
-           [{"role": "user", "content": user_message}]
-
-def call_nvidia_api(session_id, user_message):
+# ── AI CALL ───────────────────────────────────────────────────────────────────
+def call_ai(messages):
     if not NVIDIA_API_KEY:
         return None
 
     payload = {
         "model": NVIDIA_MODEL,
-        "messages": build_messages(session_id, user_message),
+        "messages": messages,
         "temperature": 0.2,
         "max_tokens": 512
     }
@@ -152,7 +167,7 @@ def call_nvidia_api(session_id, user_message):
 
     return None
 
-# ── JSON Extraction ───────────────────────────────────────────────────────────
+# ── JSON EXTRACTION ───────────────────────────────────────────────────────────
 def extract_json(raw):
     if not raw:
         return None
@@ -173,19 +188,16 @@ def extract_json(raw):
 
     return None
 
-# ── Validation ────────────────────────────────────────────────────────────────
+# ── VALIDATION ────────────────────────────────────────────────────────────────
 def validate_tasks(data):
     if not isinstance(data, dict):
-        return False, "Not JSON object"
+        return False, "Not JSON"
 
     tasks = data.get("tasks")
-    if not isinstance(tasks, list) or not tasks:
+    if not isinstance(tasks, list):
         return False, "Invalid tasks"
 
-    for i, task in enumerate(tasks):
-        if not isinstance(task, dict):
-            return False, f"Task[{i}] invalid"
-
+    for task in tasks:
         action = task.get("action")
         if action not in ALLOWED_ACTIONS:
             return False, f"Invalid action {action}"
@@ -194,24 +206,17 @@ def validate_tasks(data):
             if field not in task:
                 return False, f"{action} missing {field}"
 
-        if action == "wait":
-            if not isinstance(task.get("duration"), int):
-                return False, "wait duration invalid"
+        if "retry" in task and not isinstance(task["retry"], int):
+            return False, "retry invalid"
 
-        if action == "scroll":
-            if task.get("direction") not in ["up","down","left","right"]:
-                return False, "invalid scroll direction"
-
-        if action == "click":
-            if not (task.get("text") or (
-                isinstance(task.get("coordinates"), list)
-                and len(task["coordinates"]) == 2
-            )):
-                return False, "click invalid"
+        if "timeout" in task and not isinstance(task["timeout"], int):
+            return False, "timeout invalid"
 
     return True, ""
 
-# ── Routes ────────────────────────────────────────────────────────────────────
+# ── ROUTES ────────────────────────────────────────────────────────────────────
+
+# FULL MULTI-TASK PLAN
 @app.post("/agent")
 async def agent(request: Request):
     session_id = request.headers.get("X-Session-ID", "default")
@@ -219,32 +224,41 @@ async def agent(request: Request):
     if not check_rate_limit(session_id):
         return JSONResponse(status_code=429, content={"error": "Too fast"})
 
-    try:
-        body = await request.json()
-    except:
-        return JSONResponse(status_code=400, content={"error": "Bad JSON"})
-
+    body = await request.json()
     message = body.get("message", "").strip()
-    if not message:
-        return JSONResponse(status_code=400, content={"error": "Empty message"})
 
-    raw = call_nvidia_api(session_id, message)
-    if not raw:
-        return JSONResponse(status_code=502, content={"error": "AI failed"})
+    messages = [{"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": message}]
 
+    raw = call_ai(messages)
     parsed = extract_json(raw)
-    if not parsed:
-        return JSONResponse(status_code=422, content={"error": "Bad AI response"})
 
     valid, err = validate_tasks(parsed)
     if not valid:
-        return JSONResponse(status_code=422, content={"error": err})
-
-    # Save CLEAN JSON (fixed)
-    push_history(session_id, "user", message)
-    push_history(session_id, "assistant", json.dumps(parsed))
+        return {"error": err}
 
     return {"tasks": parsed["tasks"]}
+
+
+# AUTONOMOUS STEP LOOP
+@app.post("/agent/step")
+async def agent_step(request: Request):
+    body = await request.json()
+
+    goal = body.get("goal", "")
+    ui = body.get("ui", "")
+    last = body.get("last", "")
+
+    messages = [
+        {"role": "system", "content": STEP_PROMPT},
+        {"role": "user", "content": f"GOAL:{goal}\nUI:{ui}\nLAST:{last}"}
+    ]
+
+    raw = call_ai(messages)
+    parsed = extract_json(raw)
+
+    return parsed or {"tasks": []}
+
 
 @app.delete("/agent/history")
 async def clear(request: Request):
@@ -252,15 +266,17 @@ async def clear(request: Request):
     clear_history(session_id)
     return {"status": "cleared"}
 
+
 @app.get("/health")
 async def health():
     return {
         "status": "ok",
-        "version": "3.0.0",
+        "version": "5.0.0",
         "model": NVIDIA_MODEL
     }
 
-# ── Run ───────────────────────────────────────────────────────────────────────
+
+# ── RUN ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     uvicorn.run("app:app", host="0.0.0.0", port=port)
