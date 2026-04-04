@@ -6,6 +6,7 @@ import time
 import requests
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 import uvicorn
 
 # ── Logging ─────────────────────────────────────
@@ -13,7 +14,7 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("jarvis")
 
 # ── App ─────────────────────────────────────────
-app = FastAPI(title="Jarvis Vision AGI Backend", version="7.0.0")
+app = FastAPI(title="Jarvis Vision AGI Backend", version="7.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -32,11 +33,10 @@ NVIDIA_BASE_URL = os.environ.get(
 )
 
 REQUEST_TIMEOUT = 20
+MAX_RETRIES = 2
 
 # ── Action System ───────────────────────────────
-ALLOWED_ACTIONS = {
-    "open_app", "click", "type", "wait", "scroll"
-}
+ALLOWED_ACTIONS = {"open_app", "click", "type", "wait", "scroll"}
 
 # ── MEMORY ──────────────────────────────────────
 SESSIONS = {}
@@ -53,9 +53,10 @@ def get_session(sid):
 # ── HTTP SESSION ────────────────────────────────
 http = requests.Session()
 
-# ── AI CALL (VISION ENABLED) ────────────────────
+# ── AI CALL (FIXED + RETRY) ─────────────────────
 def call_ai(messages):
     if not NVIDIA_API_KEY:
+        log.error("❌ NVIDIA_API_KEY missing")
         return None
 
     payload = {
@@ -66,22 +67,32 @@ def call_ai(messages):
     }
 
     headers = {
-        "Authorization": f"Bearer {NVIDIA_API_KEY},
+        "Authorization": f"Bearer {NVIDIA_API_KEY}",  # ✅ FIXED
         "Content-Type": "application/json"
     }
 
-    try:
-        res = http.post(NVIDIA_BASE_URL, headers=headers, json=payload, timeout=REQUEST_TIMEOUT)
-        res.raise_for_status()
-        return res.json()["choices"][0]["message"]["content"]
-    except Exception as e:
-        log.warning(f"AI error: {e}")
-        return None
+    for attempt in range(MAX_RETRIES):
+        try:
+            res = http.post(
+                NVIDIA_BASE_URL,
+                headers=headers,
+                json=payload,
+                timeout=REQUEST_TIMEOUT
+            )
+            res.raise_for_status()
+            return res.json()["choices"][0]["message"]["content"]
+
+        except Exception as e:
+            log.warning(f"Retry {attempt+1}: {e}")
+            time.sleep(1.5 * (attempt + 1))
+
+    return None
 
 # ── JSON EXTRACT ────────────────────────────────
 def extract_json(raw):
     if not raw:
         return None
+
     raw = re.sub(r"```(?:json)?", "", raw).strip()
 
     try:
@@ -98,6 +109,28 @@ def extract_json(raw):
 
     return None
 
+# ── VALIDATION ──────────────────────────────────
+def validate(task):
+    if not task:
+        return False
+
+    if task.get("action") not in ALLOWED_ACTIONS:
+        return False
+
+    if task.get("action") == "wait":
+        return isinstance(task.get("duration"), int)
+
+    if task.get("action") == "scroll":
+        return task.get("direction") in ["up", "down", "left", "right"]
+
+    if task.get("action") == "click":
+        return (
+            "text" in task or
+            (isinstance(task.get("coordinates"), list) and len(task["coordinates"]) == 2)
+        )
+
+    return True
+
 # ── HEURISTICS ──────────────────────────────────
 def heuristic(ui):
     ui = ui.lower()
@@ -108,13 +141,16 @@ def heuristic(ui):
     if "ok" in ui:
         return {"tasks":[{"action":"click","text":"ok"}]}
 
+    if "skip" in ui:
+        return {"tasks":[{"action":"click","text":"skip"}]}
+
     return None
 
 # ── PLANNER ─────────────────────────────────────
 PLANNER_PROMPT = """
 Break goal into minimal UI steps.
 
-Return JSON:
+Return:
 {"plan":[...]}
 
 No explanation.
@@ -125,37 +161,30 @@ def create_plan(goal):
         {"role":"system","content":PLANNER_PROMPT},
         {"role":"user","content":goal}
     ]
+
     raw = call_ai(messages)
     parsed = extract_json(raw)
+
     return parsed.get("plan", []) if parsed else []
 
 # ── EXECUTOR (VISION ENABLED) ───────────────────
 STEP_PROMPT = """
 You are a vision Android agent.
 
-Input:
-- GOAL
-- UI TEXT
-- SCREEN IMAGE
-- LAST RESULT
-- FAILED ACTIONS
-
-Output:
-- ONE next action
+GOAL: {goal}
+UI: {ui}
+LAST: {last}
+FAIL: {fail}
 
 Rules:
+- ONE action only
 - Prefer text click
-- If not found → use coordinates [x,y]
+- Else use coordinates [x,y]
 - Avoid repeating failures
-- Be fast
 
-Return JSON:
+Return:
 {"tasks":[{...}]}
 """
-
-# ── VALIDATION ──────────────────────────────────
-def validate(task):
-    return task and task.get("action") in ALLOWED_ACTIONS
 
 # ── STEP LOOP ───────────────────────────────────
 @app.post("/agent/step")
@@ -171,24 +200,19 @@ async def step(request: Request):
     session = get_session(sid)
     session["goal"] = goal
 
-    # ── Heuristic
+    # ── FAST HEURISTIC
     h = heuristic(ui)
     if h:
         return h
 
-    # ── Plan init
+    # ── PLAN INIT
     if not session["plan"]:
         session["plan"] = create_plan(goal)
 
-    # ── Vision + UI message
-    content = [
-        {"type":"text","text":f"GOAL:{goal}\nUI:{ui}\nLAST:{last}\nFAIL:{session['fail'][-3:]}"}
-    ]
+    # ── PROMPT BUILD
+    content = f"GOAL:{goal}\nUI:{ui}\nLAST:{last}\nFAIL:{session['fail'][-3:]}"
 
-    if image:
-        content.append({"type":"image","image":image})
-
-    messages = [{"role":"user","content":content}]
+    messages = [{"role": "user", "content": content}]
 
     raw = call_ai(messages)
     parsed = extract_json(raw)
@@ -201,7 +225,7 @@ async def step(request: Request):
     if not validate(task):
         return {"tasks":[]}
 
-    # ── Memory update
+    # ── MEMORY UPDATE
     if last == "fail":
         session["fail"].append(task)
     else:
@@ -209,8 +233,8 @@ async def step(request: Request):
 
     session["history"].append(task)
 
-    # ── Loop breaker
-    if session["history"][-3:] == [task]*3:
+    # ── LOOP PROTECTION
+    if len(session["history"]) >= 3 and session["history"][-3:] == [task]*3:
         return {"tasks":[{"action":"scroll","direction":"down"}]}
 
     return {"tasks":[task]}
@@ -222,12 +246,18 @@ async def agent(request: Request):
     goal = body.get("message","")
 
     plan = create_plan(goal)
+
     return {"tasks":[{"action":"type","text":p} for p in plan]}
 
 # ── HEALTH ──────────────────────────────────────
 @app.get("/health")
 async def health():
-    return {"status":"ok","version":"7.0.0"}
+    return {
+        "status":"ok",
+        "version":"7.1.0",
+        "model": NVIDIA_MODEL,
+        "api_key": bool(NVIDIA_API_KEY)
+    }
 
 # ── RUN ─────────────────────────────────────────
 if __name__ == "__main__":
