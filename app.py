@@ -17,7 +17,7 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ── App ───────────────────────────────────────────────────────────────────────
-app = FastAPI(title="Android AI Agent Backend", version="2.0.0")
+app = FastAPI(title="Android AI Agent Backend", version="3.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -34,310 +34,233 @@ NVIDIA_BASE_URL = os.environ.get(
     "NVIDIA_BASE_URL",
     "https://integrate.api.nvidia.com/v1/chat/completions",
 )
+
 MAX_RETRIES     = int(os.environ.get("MAX_RETRIES", 2))
 REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", 30))
+MAX_HISTORY_TURNS = int(os.environ.get("MAX_HISTORY_TURNS", 6))
 
-# ── Action Whitelist ──────────────────────────────────────────────────────────
-ALLOWED_ACTIONS = {"open_app", "send_message", "click", "type", "wait"}
+# ── Action System ─────────────────────────────────────────────────────────────
+ALLOWED_ACTIONS = {
+    "open_app",
+    "send_message",
+    "click",
+    "type",
+    "wait",
+    "scroll",
+    "search"
+}
 
-# Required fields per action (beyond "action" itself)
-ACTION_REQUIRED_FIELDS: dict[str, list[str]] = {
-    "open_app":      ["app"],
-    "send_message":  ["app", "contact", "message"],
-    "click":         [],          # text OR coordinates — checked separately
-    "type":          ["text"],
-    "wait":          ["duration"],
+ACTION_REQUIRED_FIELDS = {
+    "open_app": ["app"],
+    "send_message": ["app", "contact", "message"],
+    "click": [],
+    "type": ["text"],
+    "wait": ["duration"],
+    "scroll": ["direction"],
+    "search": ["query"]
 }
 
 # ── System Prompt ─────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """You are an Android AI agent.
-Convert every user request into structured JSON.
 
-Rules:
-- ONLY return valid JSON
-- No explanations, no extra text
-- Always return a 'tasks' array
-- Each task must be executable on Android
+Convert user input into structured JSON tasks.
 
-Allowed actions:
-- open_app      → requires: app
-- send_message  → requires: app, contact, message
-- click         → requires: text OR coordinates
-- type          → requires: text
-- wait          → requires: duration (milliseconds, integer)
+STRICT RULES:
+- ONLY return JSON
+- NO text, NO explanation
+- ALWAYS return: {"tasks": [...]}
 
-If multiple steps are needed, return multiple tasks in order."""
+ACTIONS:
+- open_app → app
+- send_message → app, contact, message
+- click → text OR coordinates [x,y]
+- type → text
+- wait → duration (ms)
+- scroll → direction (up/down/left/right)
+- search → query
 
-# ── In-Memory Conversation Store ──────────────────────────────────────────────
-# Keyed by session_id (optional header). Falls back to a single shared slot.
-_conversation_store: dict[str, list[dict]] = {}
+Return multiple tasks if needed.
+"""
 
-MAX_HISTORY_TURNS = int(os.environ.get("MAX_HISTORY_TURNS", 6))  # user+assistant pairs
+# ── Memory ────────────────────────────────────────────────────────────────────
+_conversation_store = {}
+MAX_SESSIONS = 50
 
-
-def get_history(session_id: str) -> list[dict]:
+def get_history(session_id):
     return _conversation_store.get(session_id, [])
 
+def push_history(session_id, role, content):
+    if len(_conversation_store) > MAX_SESSIONS:
+        _conversation_store.pop(next(iter(_conversation_store)))
 
-def push_history(session_id: str, role: str, content: str) -> None:
     history = _conversation_store.setdefault(session_id, [])
     history.append({"role": role, "content": content})
-    # Keep only last N pairs (2 messages per turn)
+
     max_msgs = MAX_HISTORY_TURNS * 2
     if len(history) > max_msgs:
         _conversation_store[session_id] = history[-max_msgs:]
 
-
-def clear_history(session_id: str) -> None:
+def clear_history(session_id):
     _conversation_store.pop(session_id, None)
 
+# ── Rate Limit ────────────────────────────────────────────────────────────────
+LAST_REQUEST = {}
 
-# ── Core Functions ────────────────────────────────────────────────────────────
+def check_rate_limit(session_id):
+    now = time.time()
+    if session_id in LAST_REQUEST:
+        if now - LAST_REQUEST[session_id] < 1:
+            return False
+    LAST_REQUEST[session_id] = now
+    return True
 
-def build_messages(session_id: str, user_message: str) -> list[dict]:
-    """Assemble full message list: system prompt + history + new user turn."""
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    messages.extend(get_history(session_id))
-    messages.append({"role": "user", "content": user_message})
-    return messages
+# ── AI Call ───────────────────────────────────────────────────────────────────
+def build_messages(session_id, user_message):
+    return [{"role": "system", "content": SYSTEM_PROMPT}] + \
+           get_history(session_id) + \
+           [{"role": "user", "content": user_message}]
 
-
-def call_nvidia_api(session_id: str, user_message: str) -> str | None:
-    """
-    Call NVIDIA NIM with retry logic.
-    Retries up to MAX_RETRIES times on transient failures.
-    Returns raw text content or None on failure.
-    """
+def call_nvidia_api(session_id, user_message):
     if not NVIDIA_API_KEY:
-        log.error("NVIDIA_API_KEY is not set")
         return None
+
+    payload = {
+        "model": NVIDIA_MODEL,
+        "messages": build_messages(session_id, user_message),
+        "temperature": 0.2,
+        "max_tokens": 512
+    }
 
     headers = {
         "Authorization": f"Bearer {NVIDIA_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model":       NVIDIA_MODEL,
-        "messages":    build_messages(session_id, user_message),
-        "temperature": 0.2,
-        "max_tokens":  1024,
+        "Content-Type": "application/json"
     }
 
-    last_error: Exception | None = None
-
-    for attempt in range(1, MAX_RETRIES + 1):
+    for attempt in range(MAX_RETRIES):
         try:
-            log.info("NVIDIA API call — attempt %d/%d", attempt, MAX_RETRIES)
-            response = requests.post(
+            res = requests.post(
                 NVIDIA_BASE_URL,
                 headers=headers,
                 json=payload,
-                timeout=REQUEST_TIMEOUT,
+                timeout=REQUEST_TIMEOUT
             )
-            response.raise_for_status()
-            data = response.json()
-            raw  = data["choices"][0]["message"]["content"].strip()
-            log.info("NVIDIA raw response (attempt %d): %s", attempt, raw)
-            return raw
-
-        except requests.exceptions.Timeout as e:
-            last_error = e
-            log.warning("Attempt %d timed out", attempt)
-        except requests.exceptions.HTTPError as e:
-            last_error = e
-            status = e.response.status_code if e.response is not None else "?"
-            log.warning("Attempt %d HTTP error %s: %s", attempt, status, e)
-            # Do not retry on client-side errors
-            if e.response is not None and e.response.status_code < 500:
-                break
-        except (KeyError, IndexError, ValueError) as e:
-            last_error = e
-            log.warning("Attempt %d unexpected response structure: %s", attempt, e)
+            res.raise_for_status()
+            return res.json()["choices"][0]["message"]["content"]
         except Exception as e:
-            last_error = e
-            log.warning("Attempt %d unexpected error: %s", attempt, e)
+            log.warning(f"Retry {attempt+1}: {e}")
+            time.sleep(1.5 * (attempt + 1))
 
-        if attempt < MAX_RETRIES:
-            wait = attempt * 1.5
-            log.info("Retrying in %.1fs…", wait)
-            time.sleep(wait)
-
-    log.error("All %d attempts failed. Last error: %s", MAX_RETRIES, last_error)
     return None
 
-
-def extract_json(raw: str) -> dict | None:
-    """
-    Extract the first valid JSON object from a raw string.
-    Handles markdown fences, leading/trailing garbage text.
-    """
+# ── JSON Extraction ───────────────────────────────────────────────────────────
+def extract_json(raw):
     if not raw:
         return None
 
-    # Strip markdown code fences
-    cleaned = re.sub(r"```(?:json)?", "", raw).strip()
+    raw = re.sub(r"```(?:json)?", "", raw).strip()
 
-    # Try direct parse first
     try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError:
+        return json.loads(raw)
+    except:
         pass
 
-    # Extract first {...} block via regex
-    match = re.search(r"\{[\s\S]*\}", cleaned)
+    match = re.search(r"\{[\s\S]*\}", raw)
     if match:
         try:
             return json.loads(match.group())
-        except json.JSONDecodeError:
+        except:
             pass
 
-    log.warning("Could not extract valid JSON from response")
     return None
 
-
-def validate_tasks(data: dict) -> tuple[bool, str]:
-    """
-    Full validation of the tasks payload:
-    - tasks key exists and is a non-empty list
-    - every task has a whitelisted action
-    - every task has its required fields
-    - wait tasks have an integer duration
-    - click tasks have text or coordinates
-    """
+# ── Validation ────────────────────────────────────────────────────────────────
+def validate_tasks(data):
     if not isinstance(data, dict):
-        return False, "Response is not a JSON object"
+        return False, "Not JSON object"
 
-    if "tasks" not in data:
-        return False, "Missing 'tasks' key in response"
+    tasks = data.get("tasks")
+    if not isinstance(tasks, list) or not tasks:
+        return False, "Invalid tasks"
 
-    if not isinstance(data["tasks"], list):
-        return False, "'tasks' must be an array"
-
-    if len(data["tasks"]) == 0:
-        return False, "'tasks' array is empty"
-
-    for i, task in enumerate(data["tasks"]):
+    for i, task in enumerate(tasks):
         if not isinstance(task, dict):
-            return False, f"Task[{i}] is not an object"
+            return False, f"Task[{i}] invalid"
 
-        # ── Action key present ────────────────────────────────────────────────
-        if "action" not in task:
-            return False, f"Task[{i}] missing 'action'"
-
-        action = task["action"]
-
-        # ── Action whitelist ──────────────────────────────────────────────────
+        action = task.get("action")
         if action not in ALLOWED_ACTIONS:
-            return False, f"Task[{i}] has invalid action '{action}'. Allowed: {sorted(ALLOWED_ACTIONS)}"
+            return False, f"Invalid action {action}"
 
-        # ── Required fields per action ────────────────────────────────────────
-        required = ACTION_REQUIRED_FIELDS.get(action, [])
-        for field in required:
+        for field in ACTION_REQUIRED_FIELDS.get(action, []):
             if field not in task:
-                return False, f"Task[{i}] action '{action}' missing required field '{field}'"
+                return False, f"{action} missing {field}"
 
-        # ── wait: duration must be a positive integer ─────────────────────────
         if action == "wait":
-            duration = task.get("duration")
-            if not isinstance(duration, int) or duration <= 0:
-                return False, f"Task[{i}] 'wait' requires 'duration' to be a positive integer (ms)"
+            if not isinstance(task.get("duration"), int):
+                return False, "wait duration invalid"
 
-        # ── click: must have text or coordinates ──────────────────────────────
+        if action == "scroll":
+            if task.get("direction") not in ["up","down","left","right"]:
+                return False, "invalid scroll direction"
+
         if action == "click":
-            has_text   = "text" in task and task["text"]
-            has_coords = "coordinates" in task and isinstance(task["coordinates"], (list, dict))
-            if not has_text and not has_coords:
-                return False, f"Task[{i}] 'click' requires 'text' or 'coordinates'"
+            if not (task.get("text") or (
+                isinstance(task.get("coordinates"), list)
+                and len(task["coordinates"]) == 2
+            )):
+                return False, "click invalid"
 
     return True, ""
 
-
 # ── Routes ────────────────────────────────────────────────────────────────────
-
 @app.post("/agent")
-async def agent_endpoint(request: Request):
-    # ── Session ID (optional header for multi-turn memory) ────────────────────
+async def agent(request: Request):
     session_id = request.headers.get("X-Session-ID", "default")
 
-    # ── Parse request body ────────────────────────────────────────────────────
+    if not check_rate_limit(session_id):
+        return JSONResponse(status_code=429, content={"error": "Too fast"})
+
     try:
         body = await request.json()
-    except Exception:
-        log.warning("Malformed request body from session '%s'", session_id)
-        return JSONResponse(
-            status_code=400,
-            content={"error": "Invalid JSON request body"},
-        )
+    except:
+        return JSONResponse(status_code=400, content={"error": "Bad JSON"})
 
-    user_message: str = body.get("message", "").strip()
-    if not user_message:
-        return JSONResponse(
-            status_code=400,
-            content={"error": "Field 'message' is required and cannot be empty"},
-        )
+    message = body.get("message", "").strip()
+    if not message:
+        return JSONResponse(status_code=400, content={"error": "Empty message"})
 
-    log.info("[session=%s] Received: %s", session_id, user_message)
+    raw = call_nvidia_api(session_id, message)
+    if not raw:
+        return JSONResponse(status_code=502, content={"error": "AI failed"})
 
-    # ── Call NVIDIA API (with retry) ──────────────────────────────────────────
-    raw_response = call_nvidia_api(session_id, user_message)
-    if raw_response is None:
-        return JSONResponse(
-            status_code=502,
-            content={"error": "Failed to reach AI model after retries"},
-        )
+    parsed = extract_json(raw)
+    if not parsed:
+        return JSONResponse(status_code=422, content={"error": "Bad AI response"})
 
-    # ── Extract JSON ──────────────────────────────────────────────────────────
-    parsed = extract_json(raw_response)
-    if parsed is None:
-        log.error("[session=%s] JSON extraction failed: %s", session_id, raw_response)
-        return JSONResponse(
-            status_code=422,
-            content={"error": "Invalid AI response"},
-        )
-
-    # ── Validate tasks ────────────────────────────────────────────────────────
-    valid, error_msg = validate_tasks(parsed)
+    valid, err = validate_tasks(parsed)
     if not valid:
-        log.error("[session=%s] Validation failed: %s", session_id, error_msg)
-        return JSONResponse(
-            status_code=422,
-            content={"error": f"Invalid task structure: {error_msg}"},
-        )
+        return JSONResponse(status_code=422, content={"error": err})
 
-    # ── Persist to conversation memory ────────────────────────────────────────
-    push_history(session_id, "user",      user_message)
-    push_history(session_id, "assistant", raw_response)
+    # Save CLEAN JSON (fixed)
+    push_history(session_id, "user", message)
+    push_history(session_id, "assistant", json.dumps(parsed))
 
-    tasks = parsed["tasks"]
-    log.info("[session=%s] Returning %d task(s): %s", session_id, len(tasks), tasks)
-
-    return JSONResponse(content={"tasks": tasks})
-
+    return {"tasks": parsed["tasks"]}
 
 @app.delete("/agent/history")
-async def clear_history_endpoint(request: Request):
-    """Clear conversation memory for a session."""
+async def clear(request: Request):
     session_id = request.headers.get("X-Session-ID", "default")
     clear_history(session_id)
-    log.info("[session=%s] History cleared", session_id)
-    return JSONResponse(content={"status": "history cleared", "session_id": session_id})
-
+    return {"status": "cleared"}
 
 @app.get("/health")
 async def health():
     return {
-        "status":      "ok",
-        "version":     "2.0.0",
-        "model":       NVIDIA_MODEL,
-        "api_key_set": bool(NVIDIA_API_KEY),
-        "max_retries": MAX_RETRIES,
-        "max_history": MAX_HISTORY_TURNS,
+        "status": "ok",
+        "version": "3.0.0",
+        "model": NVIDIA_MODEL
     }
 
-
-# ── Entry Point ───────────────────────────────────────────────────────────────
-
+# ── Run ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
-    log.info("Starting Android AI Agent Backend v2.0.0 on port %d", port)
-    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
+    uvicorn.run("app:app", host="0.0.0.0", port=port)
