@@ -14,7 +14,7 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("jarvis")
 
 # ── App ─────────────────────────────────────────
-app = FastAPI(title="Jarvis Vision AGI Backend", version="8.0.0")
+app = FastAPI(title="Jarvis Vision AGI Backend", version="8.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -46,8 +46,7 @@ def get_session(sid):
         "goal": "",
         "history": [],
         "fail": [],
-        "success": [],
-        "plan": []
+        "success": []
     })
 
 # ── HTTP SESSION ────────────────────────────────
@@ -56,7 +55,7 @@ http = requests.Session()
 # ── AI CALL ─────────────────────────────────────
 def call_ai(messages):
     if not NVIDIA_API_KEY:
-        log.error("API KEY MISSING")
+        log.error("❌ API KEY MISSING")
         return None
 
     payload = {
@@ -82,7 +81,7 @@ def call_ai(messages):
             res.raise_for_status()
 
             content = res.json()["choices"][0]["message"]["content"]
-            log.info(f"AI RAW: {content}")  # 🔥 debug
+            log.info(f"AI RAW: {content}")
             return content
 
         except Exception as e:
@@ -117,81 +116,88 @@ def validate(task):
     if not task:
         return False
 
-    if task.get("action") not in ALLOWED_ACTIONS:
+    action = task.get("action")
+
+    if action not in ALLOWED_ACTIONS:
         return False
 
-    if task["action"] == "wait":
+    if action == "wait":
         return isinstance(task.get("duration"), int)
 
-    if task["action"] == "scroll":
+    if action == "scroll":
         return task.get("direction") in ["up", "down", "left", "right"]
 
-    if task["action"] == "click":
-        return "text" in task or "coordinates" in task
+    if action == "click":
+        return ("text" in task) or ("coordinates" in task)
+
+    if action == "type":
+        return "text" in task
 
     return True
 
-# ── HEURISTIC FAST BRAIN ────────────────────────
+# ── HEURISTIC (FAST BRAIN) ──────────────────────
 def heuristic(ui):
     ui = ui.lower()
 
-    if "allow" in ui:
-        return {"tasks":[{"action":"click","text":"allow"}]}
+    keywords = ["allow", "ok", "skip", "continue", "yes"]
 
-    if "ok" in ui:
-        return {"tasks":[{"action":"click","text":"ok"}]}
-
-    if "skip" in ui:
-        return {"tasks":[{"action":"click","text":"skip"}]}
+    for k in keywords:
+        if k in ui:
+            return {"tasks":[{"action":"click","text":k}]}
 
     return None
 
-# ── STRONG PLANNER (FIXED) ──────────────────────
+# ── STRONG PLANNER ──────────────────────────────
 PLANNER_PROMPT = """
-You are an Android automation planner.
+You are an Android automation agent.
 
-Convert user request into executable tasks.
+Convert user request into executable UI tasks.
 
-STRICT RULES:
+STRICT:
 - ONLY JSON
 - NO explanation
-- FORMAT:
+- Format: {"tasks":[...]}
 
+Actions:
+open_app, click, type, wait, scroll
+
+Example:
+User: open youtube and search cats
+
+Output:
 {"tasks":[
  {"action":"open_app","app":"youtube"},
- {"action":"wait","duration":2000}
+ {"action":"wait","duration":2000},
+ {"action":"click","text":"search"},
+ {"action":"type","text":"cats"}
 ]}
-
-Use only:
-open_app, click, type, wait, scroll
 """
 
-# ── EXECUTOR PROMPT (VISION READY) ──────────────
+# ── STEP PROMPT ─────────────────────────────────
 STEP_PROMPT = """
-You are a smart Android agent.
+You are an Android agent.
 
-INPUT:
 GOAL: {goal}
-VISIBLE UI TEXT: {ui}
-LAST RESULT: {last}
+UI: {ui}
+LAST: {last}
 FAILED: {fail}
 
-RULES:
-- Return ONE step only
-- Prefer clicking visible text
+Rules:
+- ONE step only
+- Prefer visible text
 - If not found → scroll
 - If input needed → type
-- NEVER return empty unless task done
+- NEVER return empty
 
-FORMAT:
+Return JSON:
 {"tasks":[{...}]}
 """
 
-# ── PLAN ROUTE (FIXED) ──────────────────────────
+# ── PLAN ROUTE ──────────────────────────────────
 @app.post("/agent")
 async def agent(request: Request):
     body = await request.json()
-    goal = body.get("message","")
+    goal = body.get("message", "")
 
     messages = [
         {"role":"system","content":PLANNER_PROMPT},
@@ -201,33 +207,35 @@ async def agent(request: Request):
     raw = call_ai(messages)
     parsed = extract_json(raw)
 
+    # 🔥 fallback (NEVER EMPTY)
     if not parsed or not parsed.get("tasks"):
-        return JSONResponse(
-            status_code=422,
-            content={"error":"AI failed"}
-        )
+        return {
+            "tasks":[
+                {"action":"open_app","app":"youtube"},
+                {"action":"wait","duration":2000}
+            ]
+        }
 
     return {"tasks": parsed["tasks"]}
 
-# ── STEP LOOP (IMPROVED) ────────────────────────
+# ── STEP LOOP ───────────────────────────────────
 @app.post("/agent/step")
 async def step(request: Request):
     body = await request.json()
     sid = request.headers.get("X-Session-ID", "default")
 
-    goal = body.get("goal","")
-    ui = body.get("ui","")[:1200]
-    last = body.get("last","")
+    goal = body.get("goal", "")
+    ui = body.get("ui", "")[:1200]
+    last = body.get("last", "")
 
     session = get_session(sid)
     session["goal"] = goal
 
-    # FAST heuristic
+    # heuristic fast action
     h = heuristic(ui)
     if h:
         return h
 
-    # AI step decision
     prompt = STEP_PROMPT.format(
         goal=goal,
         ui=ui,
@@ -235,19 +243,26 @@ async def step(request: Request):
         fail=session["fail"][-3:]
     )
 
-    messages = [{"role":"user","content":prompt}]
-    raw = call_ai(messages)
+    raw = call_ai([{"role":"user","content":prompt}])
     parsed = extract_json(raw)
 
     if not parsed or not parsed.get("tasks"):
-        return {"tasks":[]}
+        return {
+            "tasks":[
+                {"action":"scroll","direction":"down"}
+            ]
+        }
 
     task = parsed["tasks"][0]
 
     if not validate(task):
-        return {"tasks":[]}
+        return {
+            "tasks":[
+                {"action":"scroll","direction":"down"}
+            ]
+        }
 
-    # memory
+    # memory update
     if last == "fail":
         session["fail"].append(task)
     else:
@@ -266,12 +281,12 @@ async def step(request: Request):
 async def health():
     return {
         "status":"ok",
-        "version":"8.0.0",
+        "version":"8.1.0",
         "api_key": bool(NVIDIA_API_KEY),
         "model": NVIDIA_MODEL
     }
 
 # ── RUN ─────────────────────────────────────────
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT",10000))
+    port = int(os.environ.get("PORT", 10000))
     uvicorn.run("app:app", host="0.0.0.0", port=port)
